@@ -104,8 +104,13 @@ jobs:
             echo "identity=$IDENTITY"
           } >> "$GITHUB_OUTPUT"
 
-      # --- Notarization API key (optional) ---
-      # Output: key_path — path to the .p8, empty when notarization is skipped.
+      # --- Notarization credentials (optional) ---
+      # Two supported styles; either works with package-dmg.sh:
+      #   * App Store Connect API key: APPSTORE_API_KEY_ID/_ISSUER_ID/_PRIVATE_KEY
+      #   * Apple ID + app-specific password: APPLE_ID / APPLE_TEAM_ID / APPLE_APP_PASSWORD
+      # notarytool --key needs a .p8 FILE path, so the API-key content is
+      # materialized into $RUNNER_TEMP and its path emitted as key_path.
+      # Output: key_path — path to the .p8, empty when API-key auth is unavailable.
       - name: Write notarization API key
         id: notary
         env:
@@ -115,7 +120,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -z "${P8:-}" || -z "${KEY_ID:-}" || -z "${ISSUER_ID:-}" ]]; then
-            echo "Notarization secrets incomplete — skipping notarization."
+            echo "App Store Connect API key not configured — will use Apple ID auth if present."
             echo "key_path=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -131,13 +136,17 @@ jobs:
         run: ./build-app.sh
 
       # --- Notarize + staple + DMG ---
-      # package-dmg.sh only notarizes when all three APPSTORE_API_* are non-empty;
-      # APPSTORE_API_PRIVATE_KEY is empty (key_path="") when we skipped above.
+      # package-dmg.sh picks API-key auth when all three APPSTORE_API_* are set,
+      # else Apple ID auth when APPLE_ID/APPLE_TEAM_ID/APPLE_APP_PASSWORD are set,
+      # else skips notarization.
       - name: Package DMG
         env:
           APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
           APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
           APPSTORE_API_PRIVATE_KEY: ${{ steps.notary.outputs.key_path }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: ./scripts/package-dmg.sh
 
       - name: Clean up keychain

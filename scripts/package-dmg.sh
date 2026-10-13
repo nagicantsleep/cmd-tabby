@@ -4,9 +4,14 @@ set -euo pipefail
 # Packages dist/Tabby.app into a distributable DMG at dist/Tabby-<version>.dmg.
 # The DMG holds Tabby.app plus an /Applications symlink for drag-to-install.
 #
-# Notarization (optional) runs when APPSTORE_API_KEY_ID / APPSTORE_API_ISSUER_ID
-# / APPSTORE_API_PRIVATE_KEY (path to the .p8) are set. It notarizes and staples
-# both the app and the DMG so it opens cleanly on other Macs.
+# Notarization (optional) runs when credentials are present. Either credential
+# style works:
+#   * App Store Connect API key:
+#       APPSTORE_API_KEY_ID, APPSTORE_API_ISSUER_ID, APPSTORE_API_PRIVATE_KEY
+#   * Apple ID + app-specific password:
+#       APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD
+# It notarizes and staples both the app and the DMG so it opens cleanly on
+# other Macs.
 
 ROOT="${0:A:h:h}"
 cd "$ROOT"
@@ -25,19 +30,31 @@ mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/Tabby.app"
 ln -s /Applications "$STAGE/Applications"
 
+# Decide which credential style to use. Returns the notarytool auth args on
+# stdout (one per line) and 0 when credentials are available.
+notary_auth_args() {
+  if [[ -n "${APPSTORE_API_KEY_ID:-}" && -n "${APPSTORE_API_ISSUER_ID:-}" && -n "${APPSTORE_API_PRIVATE_KEY:-}" ]]; then
+    printf '%s\n' "--key" "$APPSTORE_API_PRIVATE_KEY" "--key-id" "$APPSTORE_API_KEY_ID" "--issuer" "$APPSTORE_API_ISSUER_ID"
+    return 0
+  fi
+  if [[ -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
+    printf '%s\n' "--apple-id" "$APPLE_ID" "--team-id" "$APPLE_TEAM_ID" "--password" "$APPLE_APP_PASSWORD"
+    return 0
+  fi
+  return 1
+}
+
 # Notarize a file (.zip or .dmg) and, when given a bundle to staple, attach the
 # ticket to that bundle; otherwise staple the notarized file itself.
 submit_for_notarization() {
   local artifact="$1" staple_target="$2"
-  xcrun notarytool submit "$artifact" \
-    --key "$APPSTORE_API_PRIVATE_KEY" \
-    --key-id "$APPSTORE_API_KEY_ID" \
-    --issuer "$APPSTORE_API_ISSUER_ID" \
-    --wait
+  local -a auth
+  auth=("${(@f)$(notary_auth_args)}")
+  xcrun notarytool submit "$artifact" "${auth[@]}" --wait
   xcrun stapler staple "$staple_target"
 }
 
-if [[ -n "${APPSTORE_API_KEY_ID:-}" && -n "${APPSTORE_API_ISSUER_ID:-}" && -n "${APPSTORE_API_PRIVATE_KEY:-}" ]]; then
+if notary_auth_args >/dev/null; then
   echo "Notarizing Tabby.app…"
   # notarytool needs a zip archive for a bundle target; staple the app itself.
   ZIP="$ROOT/dist/Tabby-notarize.zip"
@@ -46,7 +63,7 @@ if [[ -n "${APPSTORE_API_KEY_ID:-}" && -n "${APPSTORE_API_ISSUER_ID:-}" && -n "$
   rm -f "$ZIP"
   NOTARIZED=1
 else
-  echo "Skipping notarization (APPSTORE_API_* not set)."
+  echo "Skipping notarization (no notary credentials set)."
   NOTARIZED=0
 fi
 

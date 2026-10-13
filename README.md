@@ -84,10 +84,13 @@ Set `TABBY_NO_OPEN=1` to skip launching the app after building (useful in CI).
 ## Packaging a DMG
 
 ```sh
-./scripts/package-dmg.sh          # -> dist/Tabby.dmg
+./scripts/package-dmg.sh          # -> dist/Tabby-<version>.dmg
 ```
 
 The DMG contains `Tabby.app` and an `/Applications` symlink for drag-to-install.
+Notarization runs automatically when credentials are set in the environment
+(either `APPLE_ID` + `APPLE_TEAM_ID` + `APPLE_APP_PASSWORD`, or the
+`APPSTORE_API_*` key set); otherwise the DMG is built without notarizing.
 
 ## Releasing (CI)
 
@@ -102,28 +105,58 @@ git push origin v0.1.0
 
 ### Required repository secrets
 
+**Signing (required for a distributable, notarizable build):**
+
 | Secret | What it is |
 |---|---|
 | `MACOS_CERT_P12` | Base64 of your **Developer ID Application** certificate exported as `.p12`. |
 | `MACOS_CERT_PASSWORD` | Password you set when exporting the `.p12`. |
 | `MACOS_CERT_IDENTITY` | (Optional) Exact identity name, e.g. `Developer ID Application: Your Name (TEAMID)`. If omitted, the workflow auto-detects any Developer ID cert. |
 | `KEYCHAIN_PASSWORD` | Any random string; used for the temporary CI keychain. |
-| `APPLE_TEAM_ID` | Your 10-character Team ID (here `L9UU4DV575`). |
-| `APPSTORE_API_KEY_ID` | App Store Connect API **Key ID**. |
-| `APPSTORE_API_ISSUER_ID` | App Store Connect API **Issuer ID**. |
-| `APPSTORE_API_PRIVATE_KEY` | Contents of the App Store Connect API **`.p8`** key file. |
 
-#### Creating the App Store Connect API key (for notarization)
+**Notarization (choose ONE credential style):**
+
+| Style | Secrets |
+|---|---|
+| Apple ID + app-specific password | `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` |
+| App Store Connect API key | `APPSTORE_API_KEY_ID`, `APPSTORE_API_ISSUER_ID`, `APPSTORE_API_PRIVATE_KEY` |
+
+If neither set is complete, the workflow still builds a DMG and attaches it to
+the release, but the app will not be notarized (users must right-click → Open).
+
+#### Style A — Apple ID + app-specific password (simplest)
+
+Use this when your Apple Developer account has **not** been granted App Store
+Connect API access (App Store Connect shows "Request Access" on the API page).
+
+1. Go to [account.apple.com](https://account.apple.com) → **Sign-In & Security**.
+2. Under **App-Specific Passwords**, click **Generate an app-specific password**.
+3. Name it e.g. `Tabby Notarization`, then **Create** and confirm your password.
+4. Copy the generated password (format `xxxx-xxxx-xxxx-xxxx`) — Apple shows it
+   only once.
+5. Add the secrets (use your Apple ID email and the Team ID from
+   [developer.apple.com/account](https://developer.apple.com/account) → Membership):
+
+   ```sh
+   gh secret set APPLE_ID           --body "you@example.com"
+   gh secret set APPLE_TEAM_ID      --body "L9UU4DV575"
+   gh secret set APPLE_APP_PASSWORD --body "xxxx-xxxx-xxxx-xxxx"
+   ```
+
+#### Style B — App Store Connect API key
+
+Requires App Store Connect API access on your team (Users and Access →
+Integrations → App Store Connect API). If the page shows **Request Access**, use
+Style A instead.
 
 1. Sign in to [App Store Connect](https://appstoreconnect.apple.com).
-2. Go to **Users and Access → Integrations → App Store Connect API** (or the
-   **Keys** tab, depending on your account).
-3. Click **+** to create a key. Name it e.g. `Tabby Notarization`, and give it the
-   **Developer** role (a "team key").
+2. Go to **Users and Access → Integrations → App Store Connect API**.
+3. Click **+** to create a key. Name it e.g. `Tabby Notarization`, role
+   **Developer** (a "team key").
 4. Copy the **Key ID** (10 characters) and the **Issuer ID** (a UUID shown above
    the key list).
-5. Click **Download API Key** — you get a file named `AuthKey_<KEYID>.p8`. You can
-   only download it once; store it safely.
+5. Click **Download API Key** — you get `AuthKey_<KEYID>.p8`. You can only
+   download it once; store it safely.
 6. Add the secrets:
 
    ```sh
@@ -138,16 +171,11 @@ git push origin v0.1.0
 # In Keychain Access: My Certificates → "Developer ID Application: …" →
 # right-click → Export… → save as DeveloperID.p12 with a password.
 
-base64 -i DeveloperID.p12 | pbcopy
 gh secret set MACOS_CERT_P12      --body "$(base64 -i DeveloperID.p12)"
 gh secret set MACOS_CERT_PASSWORD --body "<p12 password>"
 gh secret set MACOS_CERT_IDENTITY --body "Developer ID Application: Your Name (TEAMID)"
 gh secret set KEYCHAIN_PASSWORD   --body "$(openssl rand -hex 16)"
-gh secret set APPLE_TEAM_ID       --body "L9UU4DV575"
 ```
-
-If the notarization secrets are absent, the workflow still builds a DMG and
-attaches it to the release, but the app will not be notarized.
 
 ## License
 
