@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Xcode / SwiftPM build products
+.build/
+.swiftpm/
+dist/
+Package.resolved
+
+# Xcode user state
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+
+# Packaging scratch
+*.dmg
+*.p12
+*.p8
+*.cer
+*.mobileprovision
+*.profiles
+
+# Editor
+.vscode/
+.idea/

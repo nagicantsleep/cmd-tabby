@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and release (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: swift --version
+
+      # --- Signing: import the Developer ID certificate into a temp keychain ---
+      - name: Import signing certificate
+        id: cert
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CERT_P12:-}" ]]; then
+            echo "No MACOS_CERT_P12 secret — building ad-hoc signed (not distributable)."
+            echo "have_cert=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "have_cert=true" >> "$GITHUB_OUTPUT"
+          KEYCHAIN="$RUNNER_TEMP/tabby-signing.keychain-db"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          # Prepend to the search list so codesign finds the identity.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning
+
+      - name: Write notarization API key
+        id: notary
+        env:
+          P8: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${P8:-}" || -z "${{ secrets.APPSTORE_API_KEY_ID }}" || -z "${{ secrets.APPSTORE_API_ISSUER_ID }}" ]]; then
+            echo "Notarization secrets incomplete — skipping notarization."
+            echo "have_notary=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "have_notary=true" >> "$GITHUB_OUTPUT"
+          echo "$P8" > "$RUNNER_TEMP/notary_key.p8"
+
+      # --- Build, sign (secure timestamp + hardened runtime) ---
+      - name: Build app
+        env:
+          TABBY_NO_OPEN: "1"
+          TABBY_TIMESTAMP: ${{ steps.cert.outputs.have_cert == 'true' && '1' || '0' }}
+          TABBY_SIGN_IDENTITY: ${{ secrets.MACOS_CERT_IDENTITY }}
+        run: ./build-app.sh
+
+      # --- Notarize + staple + DMG ---
+      - name: Package DMG
+        env:
+          APPSTORE_API_KEY_ID: ${{ steps.notary.outputs.have_notary == 'true' && secrets.APPSTORE_API_KEY_ID || '' }}
+          APPSTORE_API_ISSUER_ID: ${{ steps.notary.outputs.have_notary == 'true' && secrets.APPSTORE_API_ISSUER_ID || '' }}
+          APPSTORE_API_PRIVATE_KEY: ${{ steps.notary.outputs.have_notary == 'true' && format('{0}/notary_key.p8', runner.temp) || '' }}
+        run: ./scripts/package-dmg.sh
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/tabby-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/notary_key.p8"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tabby-${{ env.TAG }}
+          path: |
+            dist/*.dmg
+            dist/*.sha256
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.dmg dist/*.sha256 --clobber
+          else
+            gh release create "$TAG" dist/*.dmg dist/*.sha256 \
+              --title "$TAG" --generate-notes
+          fi
