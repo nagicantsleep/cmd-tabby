@@ -42,6 +42,11 @@ echo
 
 read -r -s "P12PASS?Enter a new password for the .p12: "; echo
 read -r -s "P12PASS2?Confirm the password: "; echo
+if [[ -z "$P12PASS" ]]; then
+  echo "ERROR: the .p12 password must not be empty — an empty MACOS_CERT_PASSWORD" >&2
+  echo "       breaks the CI keychain import. Run the script again." >&2
+  exit 1
+fi
 if [[ "$P12PASS" != "$P12PASS2" ]]; then
   echo "ERROR: passwords do not match." >&2
   exit 1
@@ -53,9 +58,19 @@ TMPCERT="$(mktemp -t tabby-cert)"
 trap 'rm -f "$TMPCERT"' EXIT
 security find-certificate -c "$IDENTITY" -p > "$TMPCERT"
 
+# Resolve the login keychain robustly: take only the first line and strip the
+# surrounding whitespace/quotes `security` prints.
+KEYCHAIN="$(security default-keychain | head -1 | tr -d ' "' )"
+[[ -n "$KEYCHAIN" ]] || { echo "ERROR: could not determine the default keychain." >&2; exit 1; }
+
 rm -f "$OUT"
-security export -k "$(security default-keychain | tr -d ' "')" \
+security export -k "$KEYCHAIN" \
   -t identities -f pkcs12 -P "$P12PASS" -o "$OUT" "$TMPCERT"
+
+if [[ ! -s "$OUT" ]]; then
+  echo "ERROR: export produced no file. The key may have been denied access." >&2
+  exit 1
+fi
 
 echo "Exported: $OUT ($(wc -c < "$OUT" | tr -d ' ') bytes)"
 
