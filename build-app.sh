@@ -34,6 +34,11 @@ if ! security find-identity -v -p codesigning | grep -qF "$IDENTITY"; then
   if [[ -n "$FALLBACK" && "$FALLBACK" != "$IDENTITY" ]]; then
     echo "WARNING: '$IDENTITY' not found, falling back to '$FALLBACK'." >&2
     IDENTITY="$FALLBACK"
+  else
+    # No usable identity at all: clear it so the ad-hoc branch below runs
+    # instead of codesign failing on a non-existent identity.
+    echo "WARNING: no signing identity found." >&2
+    IDENTITY=""
   fi
 fi
 

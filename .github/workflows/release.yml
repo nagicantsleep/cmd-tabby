@@ -15,30 +15,64 @@ permissions:
 
 jobs:
   release:
+    # macos-15 ships a Swift 6.x toolchain, which Package.swift requires.
     runs-on: macos-15
-    env:
-      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${DISPATCH_TAG:-}" ]]; then
+            TAG="$DISPATCH_TAG"
+          else
+            TAG="$REF_NAME"
+          fi
+          [[ -n "$TAG" ]] || { echo "ERROR: could not resolve a tag." >&2; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using tag: $TAG"
 
       - name: Show toolchain
         run: swift --version
 
+      - name: Stamp version from tag
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          echo "Stamping CFBundleShortVersionString=$VERSION CFBundleVersion=${{ github.run_number }}"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.run_number }}" Info.plist
+
       # --- Signing: import the Developer ID certificate into a temp keychain ---
+      # Outputs (explicit, so later steps never rely on ternary expressions):
+      #   have_cert  "true"/"false"
+      #   timestamp  "1" when signing with a real cert (secure timestamp is
+      #              required for notarization), else "0"
+      #   identity   signing identity name to pass to codesign
       - name: Import signing certificate
         id: cert
         env:
           CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
           CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          CERT_IDENTITY: ${{ secrets.MACOS_CERT_IDENTITY }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
           set -euo pipefail
           if [[ -z "${CERT_P12:-}" ]]; then
             echo "No MACOS_CERT_P12 secret — building ad-hoc signed (not distributable)."
-            echo "have_cert=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "have_cert=false"
+              echo "timestamp=0"
+              echo "identity="
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "have_cert=true" >> "$GITHUB_OUTPUT"
           KEYCHAIN="$RUNNER_TEMP/tabby-signing.keychain-db"
           echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
@@ -52,35 +86,58 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
           rm -f "$RUNNER_TEMP/cert.p12"
           security find-identity -v -p codesigning
+          # Resolve the identity to sign with: prefer the secret, else the first
+          # Developer ID Application cert in the imported keychain.
+          IDENTITY="${CERT_IDENTITY:-}"
+          if [[ -z "$IDENTITY" ]]; then
+            IDENTITY="$(security find-identity -v -p codesigning \
+              | sed -n 's/.*"\(Developer ID Application[^"]*\)".*/\1/p' | head -n 1)"
+          fi
+          if [[ -z "$IDENTITY" ]]; then
+            echo "ERROR: no Developer ID Application identity found after import." >&2
+            exit 1
+          fi
+          echo "Signing identity: $IDENTITY"
+          {
+            echo "have_cert=true"
+            echo "timestamp=1"
+            echo "identity=$IDENTITY"
+          } >> "$GITHUB_OUTPUT"
 
+      # --- Notarization API key (optional) ---
+      # Output: key_path — path to the .p8, empty when notarization is skipped.
       - name: Write notarization API key
         id: notary
         env:
           P8: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
         run: |
           set -euo pipefail
-          if [[ -z "${P8:-}" || -z "${{ secrets.APPSTORE_API_KEY_ID }}" || -z "${{ secrets.APPSTORE_API_ISSUER_ID }}" ]]; then
+          if [[ -z "${P8:-}" || -z "${KEY_ID:-}" || -z "${ISSUER_ID:-}" ]]; then
             echo "Notarization secrets incomplete — skipping notarization."
-            echo "have_notary=false" >> "$GITHUB_OUTPUT"
+            echo "key_path=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "have_notary=true" >> "$GITHUB_OUTPUT"
           echo "$P8" > "$RUNNER_TEMP/notary_key.p8"
+          echo "key_path=$RUNNER_TEMP/notary_key.p8" >> "$GITHUB_OUTPUT"
 
-      # --- Build, sign (secure timestamp + hardened runtime) ---
+      # --- Build + sign (hardened runtime, secure timestamp when cert present) ---
       - name: Build app
         env:
           TABBY_NO_OPEN: "1"
-          TABBY_TIMESTAMP: ${{ steps.cert.outputs.have_cert == 'true' && '1' || '0' }}
-          TABBY_SIGN_IDENTITY: ${{ secrets.MACOS_CERT_IDENTITY }}
+          TABBY_TIMESTAMP: ${{ steps.cert.outputs.timestamp }}
+          TABBY_SIGN_IDENTITY: ${{ steps.cert.outputs.identity }}
         run: ./build-app.sh
 
       # --- Notarize + staple + DMG ---
+      # package-dmg.sh only notarizes when all three APPSTORE_API_* are non-empty;
+      # APPSTORE_API_PRIVATE_KEY is empty (key_path="") when we skipped above.
       - name: Package DMG
         env:
-          APPSTORE_API_KEY_ID: ${{ steps.notary.outputs.have_notary == 'true' && secrets.APPSTORE_API_KEY_ID || '' }}
-          APPSTORE_API_ISSUER_ID: ${{ steps.notary.outputs.have_notary == 'true' && secrets.APPSTORE_API_ISSUER_ID || '' }}
-          APPSTORE_API_PRIVATE_KEY: ${{ steps.notary.outputs.have_notary == 'true' && format('{0}/notary_key.p8', runner.temp) || '' }}
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+          APPSTORE_API_PRIVATE_KEY: ${{ steps.notary.outputs.key_path }}
         run: ./scripts/package-dmg.sh
 
       - name: Clean up keychain
@@ -92,7 +149,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Tabby-${{ env.TAG }}
+          name: Tabby-${{ steps.tag.outputs.tag }}
           path: |
             dist/*.dmg
             dist/*.sha256
@@ -100,6 +157,7 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
